@@ -6,7 +6,6 @@ Optimized for large sheets (18000+ rows) using:
 """
 
 import os
-import json
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -33,9 +32,6 @@ PRODUCTS_SHEET_NAME     = os.getenv("PRODUCTS_SHEET_NAME",      "Products")
 # ──────────────────────────────────────────────
 
 def _get_creds() -> Credentials:
-    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if creds_json:
-        return Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
     return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
 def _get_gspread():
@@ -114,6 +110,7 @@ def fetch_month_week_rows(month: str, week: str) -> list[dict]:
 
     # Step 2: batch fetch matching rows only
     ranges = _build_ranges(target_rows)
+    range_start_rows = [int(r.split("!A")[1].split(":")[0]) for r in ranges]
 
     batch_result = service.spreadsheets().values().batchGet(
         spreadsheetId=SPREADSHEET_ID,
@@ -121,14 +118,24 @@ def fetch_month_week_rows(month: str, week: str) -> list[dict]:
         majorDimension="ROWS",
     ).execute()
 
+    # NOTE: Google's batchGet response valueRanges are guaranteed to be in
+    # the SAME ORDER as the requested ranges list — so we zip by position,
+    # not by re-parsing the echoed range string (which can be ambiguous
+    # with sheet names containing special characters).
     rows_data = []
-    for value_range in batch_result.get("valueRanges", []):
+    seen_row_indices = set()
+    value_ranges = batch_result.get("valueRanges", [])
+
+    for range_idx, value_range in enumerate(value_ranges):
         values    = value_range.get("values", [])
-        range_str = value_range.get("range", "")
-        start_row = _parse_start_row(range_str)
+        start_row = range_start_rows[range_idx]
 
         for i, row in enumerate(values):
             row_index = start_row + i
+            if row_index in seen_row_indices:
+                continue  # safety: never add the same sheet row twice
+            seen_row_indices.add(row_index)
+
             if len(row) < 6:
                 continue
             rows_data.append({
@@ -180,12 +187,21 @@ def filter_rows_for_distributor(
     salesman: str,
     distributor: str,
 ) -> list[dict]:
-    """Filter cached rows for a specific distributor — no API call."""
-    return [
+    """Filter cached rows for a specific distributor — no API call.
+    Dedupes by row_index as a safety net against any upstream duplication."""
+    matched = [
         r for r in cached_rows
         if r["salesman"].lower()     == salesman.lower()
         and r["distributor"].lower() == distributor.lower()
     ]
+    seen = set()
+    deduped = []
+    for r in matched:
+        if r["row_index"] in seen:
+            continue
+        seen.add(r["row_index"])
+        deduped.append(r)
+    return deduped
 
 
 # ──────────────────────────────────────────────
