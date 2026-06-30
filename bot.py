@@ -6,6 +6,10 @@ Optimized flow:
   /start → salesman → week → ONE fetch for all month+week rows (cached)
   → distributor 1 → filter from cache → enter closing
   → next distributor → complete
+
+v2: closing stock submit now passes month+week to sheets.batch_write_closing_stocks
+    so it can auto carry-forward into the next week's (or next month's 1st week's)
+    Opening Stock in the same batch call.
 """
 
 import os
@@ -424,9 +428,14 @@ async def confirm_submit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     data    = context.user_data
     updates = data.get("pending_updates", [])
+    month   = data.get("month")
+    week    = data.get("week")
 
     try:
-        sheets.batch_write_closing_stocks(updates)
+        # ✅ month + week pass பண்றதால் — closing stock write ஆன உடனே
+        #    அதே batch-ல் next week (அல்லது 4th Week-ஆனா next month 1st Week)
+        #    Opening Stock-உம் auto carry ஆகும்.
+        sheets.batch_write_closing_stocks(updates, month=month, week=week)
     except Exception as e:
         logger.error("Write failed: %s", e)
         await query.edit_message_text(
