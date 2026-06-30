@@ -31,7 +31,12 @@ PRODUCTS_SHEET_NAME     = os.getenv("PRODUCTS_SHEET_NAME",      "Products")
 #  Auth helpers
 # ──────────────────────────────────────────────
 
+import json
+
 def _get_creds() -> Credentials:
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        return Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
     return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
 def _get_gspread():
