@@ -12,7 +12,13 @@ import os
 import logging
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -48,6 +54,11 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 WEEKS = ["1st Week", "2nd Week", "3rd Week", "4th Week"]
 
+START_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("🚀 Start")]],
+    resize_keyboard=True,
+)
+
 
 def make_keyboard(options: list[str], cols: int = 2) -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(o, callback_data=o) for o in options]
@@ -66,11 +77,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         salesmen = sheets.get_salesmen()
     except Exception as e:
         logger.error("Failed to load salesmen: %s", e)
-        await update.message.reply_text("❌ Could not connect to Google Sheets. Try again later.")
+        await update.message.reply_text(
+            "❌ Could not connect to Google Sheets. Try again later.",
+            reply_markup=START_KEYBOARD,
+        )
         return ConversationHandler.END
 
     if not salesmen:
-        await update.message.reply_text("❌ No salesmen found in the sheet.")
+        await update.message.reply_text(
+            "❌ No salesmen found in the sheet.", reply_markup=START_KEYBOARD
+        )
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -233,13 +249,16 @@ async def ask_next_product(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> 
         + f"\n  Opening: *{row['opening_stock'] or '0'}*"
         + f"\n  Receipt: *{row['receipt'] or '0'}*"
         + existing
-        + f"\n\n➡️ Enter closing stock (or /skip):"
+        + f"\n\n➡️ Enter closing stock:"
     )
+    skip_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭️ Skip", callback_data="skip_product")
+    ]])
 
     if hasattr(query_or_msg, "edit_message_text"):
-        await query_or_msg.edit_message_text(text, parse_mode="Markdown")
+        await query_or_msg.edit_message_text(text, parse_mode="Markdown", reply_markup=skip_keyboard)
     else:
-        await query_or_msg.reply_text(text, parse_mode="Markdown")
+        await query_or_msg.reply_text(text, parse_mode="Markdown", reply_markup=skip_keyboard)
 
     return ENTER_CLOSING
 
@@ -277,12 +296,14 @@ async def closing_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await ask_next_product(update.message, context)
 
 
-async def skip_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def skip_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
     data = context.user_data
     row  = data["current_products"][data["product_index"]]
-    await update.message.reply_text(f"⏭️ Skipped *{row['product']}*", parse_mode="Markdown")
     data["product_index"] += 1
-    return await ask_next_product(update.message, context)
+    # Acknowledge skip then move to next product (edit current message)
+    return await ask_next_product(query, context)
 
 
 # ──────────────────────────────────────────────
@@ -299,10 +320,11 @@ async def next_distributor(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> 
         return await finalize(query_or_msg, context)
 
     next_dist = distributors[dist_index]
-    keyboard  = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"Continue → {next_dist}", callback_data="next_dist")
-    ]])
-    text = f"✅ Done!\n\n➡️ Next distributor: *{next_dist}*"
+    keyboard  = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➡️ Continue → {next_dist}", callback_data="next_dist")],
+        [InlineKeyboardButton("✅ Submit & Stop here", callback_data="submit_stop")],
+    ])
+    text = f"✅ Done with this distributor!\n\nWhat next?"
 
     if hasattr(query_or_msg, "edit_message_text"):
         await query_or_msg.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -316,6 +338,12 @@ async def continue_to_next_distributor(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     return await show_current_distributor(query, context)
+
+
+async def submit_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await finalize(query, context)
 
 
 # ──────────────────────────────────────────────
@@ -391,9 +419,10 @@ async def confirm_submit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🎉 *Done!* {len(updates)} value(s) saved.\n\n"
         f"Week: *{data['week']}* | Month: *{data['month']}*\n"
         f"Salesman: *{data['salesman']}*\n\n"
-        f"Use /start for next entry.",
+        f"Tap below for next entry.",
         parse_mode="Markdown",
     )
+    await query.message.reply_text("👇", reply_markup=START_KEYBOARD)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -404,7 +433,7 @@ async def confirm_submit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled. Use /start to begin again.")
+    await update.message.reply_text("❌ Cancelled.", reply_markup=START_KEYBOARD)
     return ConversationHandler.END
 
 
@@ -423,14 +452,20 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex("^🚀 Start$"), start),
+        ],
         states={
             SELECT_SALESMAN:  [CallbackQueryHandler(salesman_selected)],
             SELECT_WEEK:      [CallbackQueryHandler(week_selected)],
-            SHOW_DISTRIBUTOR: [CallbackQueryHandler(continue_to_next_distributor, pattern="^next_dist$")],
+            SHOW_DISTRIBUTOR: [
+                CallbackQueryHandler(continue_to_next_distributor, pattern="^next_dist$"),
+                CallbackQueryHandler(submit_stop, pattern="^submit_stop$"),
+            ],
             ENTER_CLOSING: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, closing_entered),
-                CommandHandler("skip", skip_product),
+                CallbackQueryHandler(skip_product_callback, pattern="^skip_product$"),
             ],
             CONFIRM_SUBMIT: [CallbackQueryHandler(confirm_submit, pattern="^(submit|cancel)$")],
         },
