@@ -47,7 +47,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 (
     SELECT_SALESMAN,
     SELECT_WEEK,
-    SHOW_DISTRIBUTOR,
+    SELECT_DISTRIBUTOR,
     ENTER_CLOSING,
     CONFIRM_SUBMIT,
 ) = range(5)
@@ -169,9 +169,53 @@ async def week_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Cache everything — no more API calls until final submit
     context.user_data["cached_rows"]    = all_rows        # ← cached here
     context.user_data["distributors"]   = distributors
-    context.user_data["dist_index"]     = 0
+    context.user_data["done_distributors"] = []            # track completed ones
     context.user_data["pending_updates"] = []
-    context.user_data["product_index"]  = 0
+
+    return await show_distributor_picker(query, context)
+
+
+async def show_distributor_picker(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show buttons for each distributor assigned to the salesman; completed ones are marked."""
+    data         = context.user_data
+    distributors = data["distributors"]
+    done         = data.get("done_distributors", [])
+
+    buttons = []
+    for d in distributors:
+        label = f"✅ {d}" if d in done else d
+        buttons.append(InlineKeyboardButton(label, callback_data=f"dist::{d}"))
+    rows = [buttons[i:i + 1] for i in range(0, len(buttons))]  # one per row, easier to read
+
+    remaining = len(distributors) - len(done)
+    text = (
+        f"🏪 *Select Distributor*\n"
+        f"📅 {data['week']} — {data['month']} | 👤 {data['salesman']}\n\n"
+        f"{remaining} of {len(distributors)} pending.\n"
+        f"Tap a distributor to enter its closing stock:"
+    )
+
+    if len(done) > 0:
+        rows.append([InlineKeyboardButton("✅ Submit & Finish", callback_data="submit_stop")])
+
+    keyboard = InlineKeyboardMarkup(rows)
+
+    if hasattr(query_or_msg, "edit_message_text"):
+        await query_or_msg.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        await query_or_msg.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    return SELECT_DISTRIBUTOR
+
+
+async def distributor_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Salesman tapped a specific distributor from the picker."""
+    query = update.callback_query
+    await query.answer()
+
+    distributor = query.data.split("::", 1)[1]
+    context.user_data["current_distributor"] = distributor
+    context.user_data["product_index"]       = 0
 
     return await show_current_distributor(query, context)
 
@@ -181,15 +225,8 @@ async def week_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # ──────────────────────────────────────────────
 
 async def show_current_distributor(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
-    data         = context.user_data
-    distributors = data["distributors"]
-    dist_index   = data["dist_index"]
-
-    if dist_index >= len(distributors):
-        return await finalize(query_or_msg, context)
-
-    distributor = distributors[dist_index]
-    data["current_distributor"] = distributor
+    data        = context.user_data
+    distributor = data["current_distributor"]
 
     # Filter from cache — zero API calls
     rows = sheets.filter_rows_for_distributor(
@@ -199,24 +236,18 @@ async def show_current_distributor(query_or_msg, context: ContextTypes.DEFAULT_T
     )
 
     if not rows:
-        text = (
-            f"⚠️ No products in Master for *{distributor}* — *{data['week']}*.\n"
-            f"Skipping..."
-        )
+        text = f"⚠️ No products in Master for *{distributor}* — *{data['week']}*."
         if hasattr(query_or_msg, "edit_message_text"):
             await query_or_msg.edit_message_text(text, parse_mode="Markdown")
         else:
             await query_or_msg.reply_text(text, parse_mode="Markdown")
-
-        data["dist_index"] += 1
-        return await show_current_distributor(query_or_msg, context)
+        return await show_distributor_picker(query_or_msg, context)
 
     data["current_products"] = rows
     data["product_index"]    = 0
 
-    total  = len(distributors)
     header = (
-        f"📦 *Distributor {dist_index + 1}/{total}:* {distributor}\n"
+        f"📦 *{distributor}*\n"
         f"📅 {data['week']} — {data['month']}\n"
         f"{'─' * 30}\n"
         f"Enter closing stock for each product.\n"
@@ -239,7 +270,7 @@ async def ask_next_product(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> 
     p_idx = data["product_index"]
 
     if p_idx >= len(rows):
-        return await next_distributor(query_or_msg, context)
+        return await finish_distributor(query_or_msg, context)
 
     row      = rows[p_idx]
     existing = f"  (current: {row['closing_stock']})" if row["closing_stock"] else ""
@@ -310,34 +341,21 @@ async def skip_product_callback(update: Update, context: ContextTypes.DEFAULT_TY
 #  Next distributor
 # ──────────────────────────────────────────────
 
-async def next_distributor(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
-    data = context.user_data
-    data["dist_index"] += 1
-    distributors = data["distributors"]
-    dist_index   = data["dist_index"]
+async def finish_distributor(query_or_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Mark current distributor as done and return to the distributor picker."""
+    data        = context.user_data
+    distributor = data["current_distributor"]
 
-    if dist_index >= len(distributors):
-        return await finalize(query_or_msg, context)
+    if distributor not in data["done_distributors"]:
+        data["done_distributors"].append(distributor)
 
-    next_dist = distributors[dist_index]
-    keyboard  = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"➡️ Continue → {next_dist}", callback_data="next_dist")],
-        [InlineKeyboardButton("✅ Submit & Stop here", callback_data="submit_stop")],
-    ])
-    text = f"✅ Done with this distributor!\n\nWhat next?"
-
+    text = f"✅ *{distributor}* done!"
     if hasattr(query_or_msg, "edit_message_text"):
-        await query_or_msg.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query_or_msg.edit_message_text(text, parse_mode="Markdown")
     else:
-        await query_or_msg.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query_or_msg.reply_text(text, parse_mode="Markdown")
 
-    return SHOW_DISTRIBUTOR
-
-
-async def continue_to_next_distributor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    return await show_current_distributor(query, context)
+    return await show_distributor_picker(query_or_msg, context)
 
 
 async def submit_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -398,7 +416,8 @@ async def confirm_submit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Cancelled. Use /start to begin again.")
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("👇", reply_markup=START_KEYBOARD)
         return ConversationHandler.END
 
     await query.edit_message_text("⏳ Saving to Google Sheets...")
@@ -457,10 +476,10 @@ def main() -> None:
             MessageHandler(filters.Regex("^🚀 Start$"), start),
         ],
         states={
-            SELECT_SALESMAN:  [CallbackQueryHandler(salesman_selected)],
-            SELECT_WEEK:      [CallbackQueryHandler(week_selected)],
-            SHOW_DISTRIBUTOR: [
-                CallbackQueryHandler(continue_to_next_distributor, pattern="^next_dist$"),
+            SELECT_SALESMAN:    [CallbackQueryHandler(salesman_selected)],
+            SELECT_WEEK:        [CallbackQueryHandler(week_selected)],
+            SELECT_DISTRIBUTOR: [
+                CallbackQueryHandler(distributor_picked, pattern="^dist::"),
                 CallbackQueryHandler(submit_stop, pattern="^submit_stop$"),
             ],
             ENTER_CLOSING: [
