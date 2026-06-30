@@ -84,103 +84,44 @@ def get_current_month() -> str:
 
 def fetch_month_week_rows(month: str, week: str) -> list[dict]:
     """
-    Fast fetch for large sheets:
-      Step 1 — Download col A+B only (tiny payload) to find matching row numbers
-      Step 2 — Batch fetch ONLY those rows (A:J)
-    Even at 50,000 rows, Step 1 is fast because 2 columns << 10 columns.
+    Fetch all rows matching month+week from Master sheet.
+
+    Uses a single bulk read (gspread get_all_values) then filters in Python.
+    This is simple and 100% reliable — no risk of batchGet range-matching
+    bugs. For sheets up to ~50,000 rows this single read is still fast
+    (a few seconds), and since we only do this ONCE per week-selection
+    (cached afterwards for all distributors), it is not a bottleneck.
     """
-    service = _get_sheets_service()
+    ss = _get_spreadsheet()
+    ws = ss.worksheet(MASTER_SHEET_NAME)
+    all_values = ws.get_all_values()
 
-    # Step 1: col A + B only
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{MASTER_SHEET_NAME}!A:B",
-        majorDimension="ROWS",
-    ).execute()
+    month_norm = month.strip().lower()
+    week_norm  = week.strip().lower()
 
-    col_ab = result.get("values", [])
-
-    target_rows = []
-    for idx, row in enumerate(col_ab, start=1):
-        if idx == 1:
-            continue  # skip header
-        if len(row) < 2:
-            continue
-        if (row[0].strip().lower() == month.lower() and
-                row[1].strip().lower() == week.lower()):
-            target_rows.append(idx)
-
-    if not target_rows:
-        return []
-
-    # Step 2: batch fetch matching rows only
-    ranges = _build_ranges(target_rows)
-    range_start_rows = [int(r.split("!A")[1].split(":")[0]) for r in ranges]
-
-    batch_result = service.spreadsheets().values().batchGet(
-        spreadsheetId=SPREADSHEET_ID,
-        ranges=ranges,
-        majorDimension="ROWS",
-    ).execute()
-
-    # NOTE: Google's batchGet response valueRanges are guaranteed to be in
-    # the SAME ORDER as the requested ranges list — so we zip by position,
-    # not by re-parsing the echoed range string (which can be ambiguous
-    # with sheet names containing special characters).
     rows_data = []
-    seen_row_indices = set()
-    value_ranges = batch_result.get("valueRanges", [])
+    for idx, row in enumerate(all_values, start=1):
+        if idx == 1:
+            continue  # header
+        if len(row) < 6:
+            continue
+        r_month = row[0].strip().lower()
+        r_week  = row[1].strip().lower()
+        if r_month != month_norm or r_week != week_norm:
+            continue
 
-    for range_idx, value_range in enumerate(value_ranges):
-        values    = value_range.get("values", [])
-        start_row = range_start_rows[range_idx]
-
-        for i, row in enumerate(values):
-            row_index = start_row + i
-            if row_index in seen_row_indices:
-                continue  # safety: never add the same sheet row twice
-            seen_row_indices.add(row_index)
-
-            if len(row) < 6:
-                continue
-            rows_data.append({
-                "row_index":     row_index,
-                "distributor":   row[3].strip() if len(row) > 3 else "",
-                "salesman":      row[4].strip() if len(row) > 4 else "",
-                "product":       row[5].strip() if len(row) > 5 else "",
-                "category":      row[6].strip() if len(row) > 6 else "",
-                "opening_stock": row[7].strip() if len(row) > 7 else "0",
-                "receipt":       row[8].strip() if len(row) > 8 else "0",
-                "closing_stock": row[9].strip() if len(row) > 9 else "",
-            })
+        rows_data.append({
+            "row_index":     idx,
+            "distributor":   row[3].strip() if len(row) > 3 else "",
+            "salesman":      row[4].strip() if len(row) > 4 else "",
+            "product":       row[5].strip() if len(row) > 5 else "",
+            "category":      row[6].strip() if len(row) > 6 else "",
+            "opening_stock": row[7].strip() if len(row) > 7 else "0",
+            "receipt":       row[8].strip() if len(row) > 8 else "0",
+            "closing_stock": row[9].strip() if len(row) > 9 else "",
+        })
 
     return rows_data
-
-
-def _build_ranges(row_numbers: list[int]) -> list[str]:
-    """Group consecutive row numbers into A1 ranges to minimise API calls."""
-    if not row_numbers:
-        return []
-    ranges = []
-    start = end = row_numbers[0]
-    for r in row_numbers[1:]:
-        if r == end + 1:
-            end = r
-        else:
-            ranges.append(f"{MASTER_SHEET_NAME}!A{start}:J{end}")
-            start = end = r
-    ranges.append(f"{MASTER_SHEET_NAME}!A{start}:J{end}")
-    return ranges
-
-
-def _parse_start_row(range_str: str) -> int:
-    """'Master!A5:J10' → 5"""
-    try:
-        cell_part  = range_str.split("!")[1]
-        start_cell = cell_part.split(":")[0]
-        return int("".join(filter(str.isdigit, start_cell)))
-    except Exception:
-        return 1
 
 
 # ──────────────────────────────────────────────
